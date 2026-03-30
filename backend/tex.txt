@@ -1,0 +1,295 @@
+import Reservation from "../models/reservationModel.js";
+import Table from "../models/tableModel.js";
+import Shift from "../models/shiftModel.js";
+import mongoose from "mongoose";
+
+const normalizeDate = (date) => {
+  const d = new Date(date);
+  d.setHours(0, 0, 0, 0);
+  return d;
+};
+
+const validFlow = {
+  pending: ["confirmed", "cancelled"],
+  confirmed: ["seated", "cancelled"],
+  seated: ["completed"],
+  completed: [],
+  cancelled: []
+};
+
+export const createReservation = async (req, res) => {
+  try {
+    const {
+      tableId,
+      reservationDate,
+      expectedArrivalTime,
+      numberOfGuests,
+      note
+    } = req.body;
+
+
+    const userId = req.user?.id;
+
+    if (!userId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    console.debug("CREATE RESERVATION:", req.body, "USER:", userId);
+
+    if (!tableId || !reservationDate || !numberOfGuests) {
+      return res.status(400).json({ message: "Thiếu dữ liệu bắt buộc" });
+    }
+
+    const date = normalizeDate(reservationDate);
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    if (date < today) {
+      return res.status(400).json({ message: "Không thể đặt ngày trong quá khứ" });
+    }
+
+    const table = await Table.findById(tableId);
+    if (!table || !table.isActive) {
+      return res.status(400).json({ message: "Bàn không tồn tại hoặc đã bị khóa" });
+    }
+
+    const existed = await Reservation.findOne({
+      table: tableId,
+      reservationDate: date,
+      status: { $in: ["pending", "confirmed", "seated"] }
+    });
+
+    if (existed) {
+      return res.status(409).json({ message: "Bàn này đã được đặt trong ngày" });
+    }
+
+    const reservation = await Reservation.create({
+      user: userId,
+      table: tableId,
+      reservationDate: date,
+      expectedArrivalTime,
+      numberOfGuests,
+      note
+    });
+
+    res.status(201).json({
+      message: "Đặt bàn thành công",
+      reservation
+    });
+  } catch (error) {
+    console.error("CREATE RESERVATION ERROR:", error);
+    res.status(500).json({ message: "Server error" });
+  }
+};
+
+export const getMyReservations = async (req, res) => {
+  try {
+    const reservations = await Reservation.find({ user: req.user.id }) // 🔥 FIX
+      .populate("table")
+      .sort({ reservationDate: -1 });
+
+    res.json(reservations);
+  } catch (error) {
+    console.error("GET MY RESERVATIONS ERROR:", error);
+    res.status(500).json({ message: "Server error" });
+  }
+};
+
+
+export const getAllReservations = async (req, res) => {
+  try {
+    const reservations = await Reservation.find()
+      .populate("user", "username phone")
+      .populate("table")
+      .sort({ reservationDate: 1 });
+
+    res.json(reservations);
+  } catch (error) {
+    console.error("GET ALL RESERVATIONS ERROR:", error);
+    res.status(500).json({ message: "Server error" });
+  }
+};
+
+export const confirmReservation = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const reservation = await Reservation.findById(id);
+    if (!reservation) {
+      return res.status(404).json({ message: "Không tìm thấy reservation" });
+    }
+
+    if (reservation.status !== "pending") {
+      return res.status(400).json({ message: "Chỉ xác nhận đơn pending" });
+    }
+
+    reservation.status = "confirmed";
+    await reservation.save();
+
+    res.json({
+      message: "Xác nhận đặt bàn thành công",
+      reservation
+    });
+  } catch (error) {
+    console.error("CONFIRM RESERVATION ERROR:", error);
+    res.status(500).json({ message: "Server error" });
+  }
+};
+
+export const updateReservationStatus = async (req, res) => {
+  try {
+    const { status } = req.body;
+    const { id } = req.params;
+
+    const reservation = await Reservation.findById(id);
+    if (!reservation) {
+      return res.status(404).json({ message: "Không tìm thấy reservation" });
+    }
+
+    if (!validFlow[reservation.status].includes(status)) {
+      return res.status(400).json({
+        message: `Không thể chuyển từ ${reservation.status} sang ${status}`
+      });
+    }
+
+    reservation.status = status;
+    await reservation.save();
+
+    if (status === "seated") {
+      await Table.findByIdAndUpdate(reservation.table, {
+        status: "unavailable"
+      });
+    }
+
+    if (status === "completed") {
+      await Table.findByIdAndUpdate(reservation.table, {
+        status: "available"
+      });
+    }
+
+    res.json({
+      message: "Cập nhật trạng thái thành công",
+      reservation
+    });
+  } catch (error) {
+    console.error("UPDATE STATUS ERROR:", error);
+    res.status(500).json({ message: "Server error" });
+  }
+};
+
+export const cancelReservation = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const reservation = await Reservation.findById(id);
+    if (!reservation) {
+      return res.status(404).json({ message: "Không tìm thấy reservation" });
+    }
+
+    // 🔒 chỉ chủ đơn hoặc manager mới được hủy
+    if (
+      reservation.user.toString() !== req.user.id &&
+      req.user.role !== "manager"
+    ) {
+      return res.status(403).json({ message: "Không có quyền hủy reservation này" });
+    }
+
+    if (reservation.status === "completed") {
+      return res.status(400).json({ message: "Không thể hủy đơn đã hoàn thành" });
+    }
+
+    reservation.status = "cancelled";
+    await reservation.save();
+
+    await Table.findByIdAndUpdate(reservation.table, {
+      status: "available"
+    });
+
+    res.json({
+      message: "Hủy đặt bàn thành công",
+      reservation
+    });
+  } catch (error) {
+    console.error("CANCEL RESERVATION ERROR:", error);
+    res.status(500).json({ message: "Server error" });
+  }
+};
+
+export const getAvailableTablesByDate = async (req, res) => {
+  try {
+    const { date } = req.query;
+    if (!date) {
+      return res.status(400).json({ message: "Thiếu ngày" });
+    }
+
+    const normalizedDate = normalizeDate(date);
+
+    const reservedTables = await Reservation.find({
+      reservationDate: normalizedDate,
+      status: { $in: ["pending", "confirmed", "seated"] }
+    }).distinct("table");
+
+    const tables = await Table.find({
+      _id: { $nin: reservedTables },
+      isActive: true
+    });
+
+    res.json(tables);
+  } catch (error) {
+    console.error("GET AVAILABLE TABLES ERROR:", error);
+    res.status(500).json({ message: "Server error" });
+  }
+};
+
+export const waiterSeated = async (req, res) => {
+  try {
+    const { id, role } = req.user;
+
+    if (role !== "waiter") {
+      return res.status(403).json({ message: "Chỉ dành cho nhân viên phục vụ" });
+    }
+
+    // ====== DATE FROM QUERY ======
+    const dateStr = req.query.date; // YYYY-MM-DD
+
+    if (!dateStr) {
+      return res.status(400).json({ message: "Thiếu ngày lọc" });
+    }
+
+    const startOfDay = new Date(`${dateStr}T00:00:00.000Z`);
+    const endOfDay   = new Date(`${dateStr}T23:59:59.999Z`);
+
+    // ====== CHECK SHIFT ======
+    const shift = await Shift.findOne({
+      dayStr: dateStr,
+      waitersStatus: {
+        $elemMatch: {
+          waiter: new mongoose.Types.ObjectId(id),
+          status: "working"
+        }
+      }
+    });
+
+    if (!shift) {
+      return res.status(400).json({ message: "Nhân viên không làm việc ngày này" });
+    }
+
+    // ====== FETCH RESERVATIONS ======
+    const reservations = await Reservation.find({
+      status: "seated",
+      servedByWaiter: null,
+      reservationDate: {
+        $gte: startOfDay,
+        $lte: endOfDay
+      }
+    })
+      .populate("table")
+      .populate("user", "username phone")
+      .sort({ reservationDate: 1 });
+
+    res.json(reservations);
+  } catch (error) {
+    console.error("GET SEATED RESERVATIONS ERROR:", error);
+    res.status(500).json({ message: "Server error" });
+  }
+};

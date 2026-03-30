@@ -1,0 +1,7 @@
+/GET read
+
+/POST create
+
+PUT/PATCH update all , update partial
+
+/DELETE
